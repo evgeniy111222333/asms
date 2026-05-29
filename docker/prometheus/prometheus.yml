@@ -1,0 +1,97 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+  external_labels:
+    cluster: 'acms'
+    environment: 'production'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  # Go API Gateway metrics
+  - job_name: 'api-gateway'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api-gateway:8080']
+        labels:
+          service: 'api-gateway'
+          language: 'go'
+
+  # Go Monitor Service - Prometheus metrics endpoint
+  - job_name: 'monitor'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['monitor:8081']
+        labels:
+          service: 'monitor'
+          language: 'go'
+
+  # Go Connector Service
+  - job_name: 'connector'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['connector:8082']
+        labels:
+          service: 'connector'
+          language: 'go'
+
+  # Python API Server
+  - job_name: 'python-api'
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['python-api:8000']
+        labels:
+          service: 'python-api'
+          language: 'python'
+
+  # Rust ACMS Core
+  - job_name: 'acms-core'
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['acms-core:50051']
+        labels:
+          service: 'acms-core'
+          language: 'rust'
+
+  # Redis exporter (if available)
+  - job_name: 'redis'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['redis:6379']
+        labels:
+          service: 'redis'
+
+  # PostgreSQL exporter (if available)
+  - job_name: 'postgres'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['postgres:5432']
+        labels:
+          service: 'postgres'
+
+  # Redpanda metrics
+  - job_name: 'redpanda'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['redpanda:9644']
+        labels:
+          service: 'redpanda'

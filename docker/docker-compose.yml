@@ -1,0 +1,339 @@
+version: "3.9"
+
+x-common-env: &common-env
+  JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+  REDIS_URL: redis://redis:6379/0
+  REDPANDA_BROKERS: redpanda:9092
+  DATABASE_URL: postgresql://acms:acms@postgres:5432/acms?sslmode=disable
+
+x-resource-limits: &default-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512M
+      reservations:
+        cpus: "0.25"
+        memory: 128M
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+networks:
+  acms-frontend:
+    driver: bridge
+  acms-backend:
+    driver: bridge
+  acms-data:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+  redis-data:
+    driver: local
+  redpanda-data:
+    driver: local
+  acms-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  postgres-backup:
+    driver: local
+
+services:
+  # ─── Infrastructure ────────────────────────────────────────
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: acms
+      POSTGRES_USER: acms
+      POSTGRES_PASSWORD: acms
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - postgres-backup:/backups
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acms -d acms"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-data
+    <<: *default-limits
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-data
+    <<: *default-limits
+
+  # Redpanda (Kafka-compatible)
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --node-id 0
+      - --check=false
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy: true'"]
+      <<: *healthcheck-defaults
+      start_period: 45s
+    networks:
+      - acms-data
+    <<: *default-limits
+
+  # ─── Monitoring Stack ─────────────────────────────────────
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:10.3.3
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      <<: *healthcheck-defaults
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - acms-backend
+      - acms-frontend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ─── Application Services ─────────────────────────────────
+
+  # Rust ACMS Core
+  acms-core:
+    build:
+      context: ../rust
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+    environment:
+      <<: *common-env
+      RUST_LOG: info
+      RUST_BACKTRACE: 1
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-backend
+      - acms-data
+    <<: *default-limits
+
+  # Python API Server
+  python-api:
+    build:
+      context: ../python
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      PYTHON_API_URL: http://python-api:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ../python:/app
+      - acms-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-backend
+      - acms-data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+  # Go API Gateway
+  api-gateway:
+    build:
+      context: ../go
+      dockerfile: Dockerfile
+      args:
+        SERVICE: gateway
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *common-env
+      GATEWAY_PORT: "8080"
+      PYTHON_API_URL: http://python-api:8000
+      MONITOR_URL: http://monitor:8081
+      CONNECTOR_URL: http://connector:8082
+      RATE_LIMIT_PER_SEC: "100"
+      CORS_HOSTS: "*"
+      GATEWAY_READ_TIMEOUT: 15s
+      GATEWAY_WRITE_TIMEOUT: 30s
+    depends_on:
+      python-api:
+        condition: service_healthy
+      monitor:
+        condition: service_started
+      connector:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-frontend
+      - acms-backend
+      - acms-data
+    <<: *default-limits
+
+  # Go Monitor Service
+  monitor:
+    build:
+      context: ../go
+      dockerfile: Dockerfile
+      args:
+        SERVICE: monitor
+    ports:
+      - "8081:8081"
+    environment:
+      <<: *common-env
+      MONITOR_PORT: "8081"
+      PYTHON_API_URL: http://python-api:8000
+      CONNECTOR_URL: http://connector:8082
+      GATEWAY_URL: http://api-gateway:8080
+      CHECK_INTERVAL_SEC: "30"
+    depends_on:
+      python-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-backend
+      - acms-data
+    <<: *default-limits
+
+  # Go Connector Service
+  connector:
+    build:
+      context: ../go
+      dockerfile: Dockerfile
+      args:
+        SERVICE: connector
+    ports:
+      - "8082:8082"
+    environment:
+      <<: *common-env
+      CONNECTOR_PORT: "8082"
+      REDPANDA_BROKERS: redpanda:9092
+      RECONNECT_BASE_MS: "500"
+      RECONNECT_MAX_MS: "30000"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8082/health"]
+      <<: *healthcheck-defaults
+    networks:
+      - acms-backend
+      - acms-data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
