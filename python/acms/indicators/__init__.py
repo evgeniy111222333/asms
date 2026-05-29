@@ -554,7 +554,8 @@ class MACD:
         if np.all(np.isnan(signal_line)):
             return None
         signal_full = np.full_like(closes, np.nan)
-        signal_full[valid] = signal_line
+        if valid.sum() > 0:
+            signal_full[valid] = signal_line[:valid.sum()]
         macd_last = macd_line[-1] if not np.isnan(macd_line[-1]) else 0.0
         signal_last = signal_full[-1] if not np.isnan(signal_full[-1]) else 0.0
         hist_last = macd_last - signal_last

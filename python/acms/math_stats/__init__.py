@@ -1649,7 +1649,7 @@ class GrangerCausalityTest:
         return {
             "f_statistic": float(best_f),
             "p_value": float(best_p),
-            "causes": best_p < 0.05,
+            "causes": bool(best_p < 0.05),
             "best_lag": best_lag,
         }
 

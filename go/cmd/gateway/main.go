@@ -101,7 +101,17 @@ func NewGatewayService(cfg *config.GatewayConfig, logger *zap.Logger) (*GatewayS
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
 			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins in development; restrict in production
+				// Allow if CORS_HOSTS is "*" (development mode), otherwise check against allowed origins
+				if len(g.config.CORSHosts) == 1 && g.config.CORSHosts[0] == "*" {
+					return true
+				}
+				origin := r.Header.Get("Origin")
+				for _, allowed := range g.config.CORSHosts {
+					if origin == allowed {
+						return true
+					}
+				}
+				return false
 			},
 		},
 	}, nil

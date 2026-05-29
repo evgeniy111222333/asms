@@ -404,7 +404,11 @@ class RollingMetrics:
         if len(equity_curve) < window + 1:
             return np.array([])
 
-        returns = np.diff(equity_curve) / equity_curve[:-1]
+        # Safe returns - guard against zero values
+        equity_safe = np.where(equity_curve[:-1] == 0, np.nan, equity_curve[:-1])
+        returns = np.diff(equity_curve) / equity_safe
+        returns = np.nan_to_num(returns, nan=0.0)
+
         n = len(returns)
         rolling = np.full(n, np.nan)
 
@@ -433,7 +437,11 @@ class RollingMetrics:
         if len(equity_curve) < window + 1:
             return np.array([])
 
-        returns = np.diff(equity_curve) / equity_curve[:-1]
+        # Safe returns - guard against zero values
+        equity_safe = np.where(equity_curve[:-1] == 0, np.nan, equity_curve[:-1])
+        returns = np.diff(equity_curve) / equity_safe
+        returns = np.nan_to_num(returns, nan=0.0)
+
         n = len(returns)
         rolling = np.full(n, np.nan)
 
@@ -466,7 +474,10 @@ class RollingMetrics:
         for i in range(window - 1, n):
             window_equity = equity_curve[i - window + 1:i + 1]
             peak = np.maximum.accumulate(window_equity)
-            dd = (peak - window_equity) / peak
+            # Guard against zero peak
+            safe_peak = np.where(peak == 0, np.nan, peak)
+            dd = (peak - window_equity) / safe_peak
+            dd = np.nan_to_num(dd, nan=0.0)
             rolling[i] = np.max(dd)
 
         return rolling
@@ -1056,12 +1067,44 @@ class BacktestEngine:
                 benchmark_return=benchmark_return,
             )
 
-        returns = np.diff(equity) / equity[:-1]
+        # Guard against zero/negative equity to prevent division by zero
+        if equity[0] <= 0:
+            return BacktestResult(
+                total_return=0, annualized_return=0, sharpe_ratio=0,
+                sortino_ratio=0, max_drawdown=0, max_drawdown_duration_bars=0,
+                calmar_ratio=0, win_rate=0, profit_factor=0,
+                total_trades=0, avg_trade_pnl=0, avg_winning_trade=0,
+                avg_losing_trade=0, avg_holding_period=0,
+                trades=trades, equity_curve=equity,
+                benchmark_return=benchmark_return,
+            )
+
+        # Safe returns calculation - replace zeros to prevent warnings
+        equity_safe = np.where(equity[:-1] == 0, np.nan, equity[:-1])
+        returns = np.diff(equity) / equity_safe
+        returns = np.nan_to_num(returns, nan=0.0)
+
         total_return = (equity[-1] / equity[0]) - 1
         bars = len(equity)
         if annualization is None:
             annualization = 365 * 24 * 60  # minute bars
-        annualized_return = (1 + total_return) ** (annualization / bars) - 1 if bars > 0 else 0
+
+        # Guard against extreme values causing overflow
+        # Cap total_return at reasonable bounds for power calculation
+        total_return_clamped = max(min(total_return, 100), -0.9999)
+        exponent = annualization / bars if bars > 0 else 0
+        
+        # For extreme cases, cap the annualized return directly
+        if abs(total_return) > 100 or exponent > 5000:
+            # Extreme case - just return a capped value based on total return sign
+            annualized_return = 1000.0 if total_return > 0 else -0.99
+        else:
+            try:
+                annualized_return = (1 + total_return_clamped) ** exponent - 1
+                if not np.isfinite(annualized_return):
+                    annualized_return = 1000.0 if total_return > 0 else -0.99
+            except (OverflowError, FloatingPointError):
+                annualized_return = 1000.0 if total_return > 0 else -0.99
 
         rf_per_bar = 0.0
         excess_returns = returns - rf_per_bar
