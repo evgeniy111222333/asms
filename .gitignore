@@ -133,6 +133,10 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+# Concept and docs
+Concept.md
+*.md
+
 # Pyre type checker
 .pyre/
 
