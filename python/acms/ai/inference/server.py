@@ -693,7 +693,7 @@ class ModelServer:
             try:
                 await self._server_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Model server task cancelled during stop")
         if self._cache:
             await self._cache.disconnect()
         logger.info("ModelServer stopped")
@@ -925,7 +925,7 @@ class BatchInferenceEngine:
             try:
                 await self._batch_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Batch processor task cancelled during stop")
 
     async def predict_batch(self, requests: List[InferenceRequest]) -> List[InferenceResponse]:
         """Execute a list of inference requests as a batch."""

@@ -396,7 +396,7 @@ class GPUMonitor:
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                logger.debug("GPU monitor task cancelled during stop")
         logger.info("GPU monitor stopped")
 
     def _detect_gpus(self) -> None:
@@ -492,7 +492,7 @@ class GPUMonitor:
                     gpu_info.health = GPUHealth.OFFLINE
             pynvml.nvmlShutdown()
         except ImportError:
-            pass
+            logger.debug("pynvml not available for GPU stats update")
 
     def _check_health(self) -> None:
         """Check GPU health and generate alerts."""

@@ -248,6 +248,7 @@ impl ExecutionEngine {
         }
         order.status = OrderStatus::Submitted;
         order.updated_at = Utc::now();
+        order.submitted_at = Some(Utc::now());
         self.orders.insert(order.id.clone(), order.clone());
         self.open_order_ids.write().push(order.id.clone());
         Ok(())
@@ -400,7 +401,7 @@ impl ExecutionEngine {
             .get_mut(order_id)
             .ok_or_else(|| format!("Order {} not found", order_id.as_str()))?;
 
-        let start = order.updated_at;
+        let start = order.submitted_at.unwrap_or(order.created_at);
         let now = Utc::now();
 
         // Compute slippage before mutating order

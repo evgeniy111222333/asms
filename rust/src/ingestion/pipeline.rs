@@ -284,7 +284,7 @@ pub fn candles_to_record_batch(candles: &[Candle]) -> Result<RecordBatch, String
         open_times.append_value(candle.open_time.timestamp_millis());
         close_times.append_value(candle.close_time.timestamp_millis());
         symbols.append_value(candle.symbol.as_str());
-        exchanges.append_value("unknown");
+        exchanges.append_value(candle.exchange.to_string());
         timeframes.append_value(candle.timeframe.to_string());
         opens.append_value(candle.open.to_string().parse::<f64>().unwrap_or(0.0));
         highs.append_value(candle.high.to_string().parse::<f64>().unwrap_or(0.0));
@@ -586,6 +586,7 @@ mod tests {
         let now = chrono::Utc::now();
         let candles = vec![Candle {
             symbol: Symbol::new("BTC/USDT"),
+            exchange: ExchangeId::Binance,
             timeframe: Timeframe::M1,
             open_time: now,
             close_time: now + chrono::Duration::seconds(60),
@@ -632,6 +633,7 @@ mod tests {
         let now = chrono::Utc::now();
         let candles = vec![Candle {
             symbol: Symbol::new("BTC/USDT"),
+            exchange: ExchangeId::Binance,
             timeframe: Timeframe::M1,
             open_time: now,
             close_time: now + chrono::Duration::seconds(60),

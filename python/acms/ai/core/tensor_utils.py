@@ -128,7 +128,7 @@ class TensorDataset:
             metadata = pq.read_metadata(self.features_path)
             return metadata.num_rows
         except ImportError:
-            pass
+            logger.debug("pyarrow not available for Parquet metadata peek")
         except Exception as e:
             logger.warning("Could not peek at Parquet metadata: %s", e)
 
@@ -294,8 +294,8 @@ class StreamingDataLoader:
             import pyarrow.parquet as pq
             metadata = pq.read_metadata(self.features_path)
             return metadata.num_rows
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not count rows via Parquet metadata: %s", e)
 
         import pandas as pd
         df = pd.read_parquet(self.features_path, columns=[])

@@ -271,6 +271,7 @@ impl CandleAggregator {
             Some(c) if c.open_time.timestamp() != candle_start => {
                 let completed = Candle {
                     symbol: self.symbol.clone(),
+                    exchange: self.exchange,
                     timeframe: self.timeframe,
                     open_time: c.open_time,
                     close_time: c.close_time,
@@ -340,6 +341,7 @@ impl CandleAggregator {
     pub fn current_candle(&self) -> Option<Candle> {
         self.current_candle.as_ref().map(|c| Candle {
             symbol: self.symbol.clone(),
+            exchange: self.exchange,
             timeframe: self.timeframe,
             open_time: c.open_time,
             close_time: c.close_time,
@@ -365,6 +367,7 @@ impl CandleAggregator {
         self.current_candle.take().map(|c| {
             let candle = Candle {
                 symbol: self.symbol.clone(),
+                exchange: self.exchange,
                 timeframe: self.timeframe,
                 open_time: c.open_time,
                 close_time: c.close_time,

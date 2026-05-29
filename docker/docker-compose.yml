@@ -1,10 +1,11 @@
 version: "3.9"
 
 x-common-env: &common-env
-  JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+  JWT_SECRET: ${JWT_SECRET}
   REDIS_URL: redis://redis:6379/0
   REDPANDA_BROKERS: redpanda:9092
-  DATABASE_URL: postgresql://acms:acms@postgres:5432/acms?sslmode=disable
+  DATABASE_URL: postgresql://acms:${POSTGRES_PASSWORD}@postgres:5432/acms?sslmode=disable
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
 
 x-resource-limits: &default-limits
   deploy:
@@ -55,7 +56,7 @@ services:
     environment:
       POSTGRES_DB: acms
       POSTGRES_USER: acms
-      POSTGRES_PASSWORD: acms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
     ports:
       - "5432:5432"

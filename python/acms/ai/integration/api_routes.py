@@ -36,7 +36,16 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 security = HTTPBearer()
-auth_manager = AuthManager()
+
+# AuthManager requires JWT_SECRET - create lazily to avoid import errors
+_auth_manager = None
+
+def get_auth_manager():
+    """Get or create AuthManager (lazy initialization)."""
+    global _auth_manager
+    if _auth_manager is None:
+        _auth_manager = AuthManager()
+    return _auth_manager
 
 # Global references set by the orchestrator
 _ai_orchestrator: Optional[Any] = None
@@ -95,7 +104,7 @@ ai_rate_limiter = AIRateLimiter(default_limit=60, window_seconds=60)
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> TokenData:
     """Validate JWT token and return user data."""
     token = credentials.credentials
-    data = auth_manager.verify_token(token)
+    data = get_auth_manager().verify_token(token)
     if data is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return data

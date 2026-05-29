@@ -130,7 +130,7 @@ impl DataNormalizer {
             .ok_or_else(|| format!("Unknown symbol {} for exchange {}", raw.symbol, raw.exchange))?
             .clone();
 
-        let side = raw.side.unwrap_or(Side::Buy); // Default if not provided
+        let side = raw.side.ok_or_else(|| format!("Unknown side for tick on exchange {}", raw.exchange))?;
 
         let precision = self.precisions.get(&raw.exchange);
         let price = match precision {

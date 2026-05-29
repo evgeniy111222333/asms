@@ -306,6 +306,7 @@ pub struct Order {
     pub exchange_order_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub submitted_at: Option<DateTime<Utc>>,
     pub commission: Decimal,
     pub commission_asset: Option<String>,
     pub strategy_id: Option<String>,
@@ -340,6 +341,7 @@ impl Order {
             strategy_id: None,
             signal_id: None,
             tags: Vec::new(),
+            submitted_at: None,
         }
     }
 
@@ -376,6 +378,7 @@ impl Order {
             strategy_id: None,
             signal_id: None,
             tags: Vec::new(),
+            submitted_at: None,
         }
     }
 
@@ -461,6 +464,7 @@ impl Position {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {
     pub symbol: Symbol,
+    pub exchange: ExchangeId,
     pub timeframe: Timeframe,
     pub open_time: DateTime<Utc>,
     pub close_time: DateTime<Utc>,
@@ -890,6 +894,7 @@ mod tests {
         let now = chrono::Utc::now();
         let candle = Candle {
             symbol: Symbol::new("BTC/USDT"),
+            exchange: ExchangeId::Paper,
             timeframe: Timeframe::M1,
             open_time: now,
             close_time: now + chrono::Duration::seconds(60),
@@ -988,6 +993,7 @@ mod tests {
         let now = chrono::Utc::now();
         let candle = Candle {
             symbol: Symbol::new("BTC/USDT"),
+            exchange: ExchangeId::Paper,
             timeframe: Timeframe::M1,
             open_time: now,
             close_time: now + chrono::Duration::seconds(60),
@@ -1067,6 +1073,7 @@ mod tests {
         let now = chrono::Utc::now();
         let candle = Candle {
             symbol: Symbol::new("BTC/USDT"),
+            exchange: ExchangeId::Paper,
             timeframe: Timeframe::M1,
             open_time: now,
             close_time: now + chrono::Duration::seconds(60),

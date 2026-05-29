@@ -324,7 +324,7 @@ class AIOrchestrator:
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    logger.debug("AI orchestrator task cancelled during stop")
 
         # Stop consumers
         if self.market_data_consumer:
@@ -588,6 +588,65 @@ class AIOrchestrator:
     # Feature Computation
     # ========================================================================
 
+    def _compute_features(self, market_data: Dict) -> Dict[str, float]:
+        """Compute real features from market data."""
+        try:
+            features = {}
+            if hasattr(self, '_feature_engineer') and self._feature_engineer is not None:
+                result = self._feature_engineer.compute_all(market_data)
+                if result:
+                    features.update(result)
+
+            # Price-based features
+            prices = market_data.get("prices", [])
+            if prices and len(prices) > 1:
+                import numpy as np
+                returns = np.diff(np.log(prices)) if all(p > 0 for p in prices) else np.diff(prices) / np.array(prices[:-1])
+                features["return_mean"] = float(np.mean(returns)) if len(returns) > 0 else 0.0
+                features["return_std"] = float(np.std(returns)) if len(returns) > 0 else 0.0
+                features["return_skew"] = float(self._safe_skew(returns)) if len(returns) > 2 else 0.0
+                features["return_kurt"] = float(self._safe_kurtosis(returns)) if len(returns) > 3 else 0.0
+                features["price_momentum_5"] = float((prices[-1] / prices[-5] - 1)) if len(prices) >= 5 else 0.0
+                features["price_momentum_20"] = float((prices[-1] / prices[-20] - 1)) if len(prices) >= 20 else 0.0
+                features["volatility"] = float(np.std(returns) * np.sqrt(252)) if len(returns) > 0 else 0.0
+
+            # Volume features
+            volumes = market_data.get("volumes", [])
+            if volumes and len(volumes) > 1:
+                import numpy as np
+                features["volume_mean"] = float(np.mean(volumes))
+                features["volume_std"] = float(np.std(volumes))
+                features["volume_ratio"] = float(volumes[-1] / np.mean(volumes)) if np.mean(volumes) > 0 else 1.0
+
+            return features
+        except Exception as e:
+            logger.warning(f"Feature computation error: {e}")
+            return {}
+
+    @staticmethod
+    def _safe_skew(returns: 'np.ndarray') -> float:
+        """Compute skewness safely."""
+        n = len(returns)
+        if n < 3:
+            return 0.0
+        mean = returns.mean()
+        std = returns.std()
+        if std < 1e-10:
+            return 0.0
+        return float(np.mean(((returns - mean) / std) ** 3))
+
+    @staticmethod
+    def _safe_kurtosis(returns: 'np.ndarray') -> float:
+        """Compute excess kurtosis safely."""
+        n = len(returns)
+        if n < 4:
+            return 0.0
+        mean = returns.mean()
+        std = returns.std()
+        if std < 1e-10:
+            return 0.0
+        return float(np.mean(((returns - mean) / std) ** 4) - 3.0)
+
     async def compute_features(self, symbol: str, timeframe: str,
                                 feature_set: str = "default") -> Dict[str, Any]:
         """Compute features for a symbol/timeframe.
@@ -598,14 +657,60 @@ class AIOrchestrator:
             feature_set: Feature set identifier.
 
         Returns:
-            Feature data dict.
+            Feature data dict or error.
         """
         # Delegate to feature engineering pipeline
         try:
-            from acms.ml import FeatureEngineer
-            engineer = FeatureEngineer(window=60)
-            # In production, this would fetch real market data
-            return {"symbol": symbol, "timeframe": timeframe, "status": "computed_placeholder"}
+            # Try to use AdvancedFeatureEngineer if available
+            try:
+                from acms.ai.features.engineering import AdvancedFeatureEngineer
+                engineer = AdvancedFeatureEngineer()
+                
+                # Fetch market data from cache or DB
+                cached_features = await self.feature_cache.get(symbol, timeframe)
+                
+                # Validate we have sufficient data
+                MIN_PRICE_HISTORY = 20  # Minimum candles for meaningful features
+                prices = cached_features.get("prices", []) if cached_features else []
+                volumes = cached_features.get("volumes", []) if cached_features else []
+                
+                if not cached_features or not prices:
+                    # No data available - return error, NOT silent fallback
+                    logger.warning(
+                        "Insufficient market data for features: symbol=%s timeframe=%s "
+                        "prices_count=%d. Orchestrator should wait for data ingestion.",
+                        symbol, timeframe, len(prices)
+                    )
+                    return {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "error": "insufficient_market_data",
+                        "error_detail": f"Need at least {MIN_PRICE_HISTORY} candles, got {len(prices)}",
+                        "status": "degraded",
+                    }
+                
+                if len(prices) < MIN_PRICE_HISTORY:
+                    logger.warning(
+                        "Limited market data: symbol=%s timeframe=%s prices_count=%d < %d",
+                        symbol, timeframe, len(prices), MIN_PRICE_HISTORY
+                    )
+                    return {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "error": "limited_market_data",
+                        "prices_count": len(prices),
+                        "status": "degraded",
+                    }
+                
+                # Data is sufficient, compute features
+                computed = self._compute_features(cached_features)
+                return {"symbol": symbol, "timeframe": timeframe, **computed}
+                
+            except ImportError:
+                logger.debug("Feature engineering module not available")
+
+            # Fallback: basic feature computation
+            return {"symbol": symbol, "timeframe": timeframe, "status": "no_feature_engineer"}
         except Exception as e:
             logger.error("Feature computation error: %s", e)
             return {"error": str(e)}
@@ -768,12 +873,87 @@ class AIOrchestrator:
 
     async def _on_tick_data(self, data: Dict[str, Any]) -> None:
         """Handle incoming tick data from Kafka."""
-        pass  # Tick data processed in real-time
+        try:
+            symbol = data.get("symbol")
+            price = data.get("price", 0)
+            volume = data.get("volume", 0)
+
+            if symbol and price > 0:
+                # Update internal tick buffer
+                if not hasattr(self, '_tick_buffers'):
+                    self._tick_buffers = {}
+                if symbol not in self._tick_buffers:
+                    self._tick_buffers[symbol] = []
+                self._tick_buffers[symbol].append(data)
+
+                # Keep only last 1000 ticks per symbol
+                if len(self._tick_buffers[symbol]) > 1000:
+                    self._tick_buffers[symbol] = self._tick_buffers[symbol][-1000:]
+
+                # Trigger real-time risk update if risk engine is available
+                if hasattr(self, '_risk_engine') and self._risk_engine:
+                    self._risk_engine.update_price(symbol, price)
+
+                # Check for microstructure signals
+                self._check_microstructure_signals(symbol, data)
+
+        except Exception as e:
+            logger.warning(f"Tick data processing error: {e}")
+
+    def _check_microstructure_signals(self, symbol: str, data: Dict) -> None:
+        """Check for microstructure signals from tick data."""
+        try:
+            if not hasattr(self, '_tick_buffers') or symbol not in self._tick_buffers:
+                return
+            ticks = self._tick_buffers[symbol]
+            if len(ticks) < 10:
+                return
+            # Check for sudden price moves (more than 2 std devs in short window)
+            recent_prices = [t.get("price", 0) for t in ticks[-10:]]
+            if len(recent_prices) >= 10 and all(p > 0 for p in recent_prices):
+                import numpy as np
+                mean_price = np.mean(recent_prices[:-1])
+                std_price = np.std(recent_prices[:-1])
+                if std_price > 0 and abs(recent_prices[-1] - mean_price) > 2 * std_price:
+                    logger.info(f"Microstructure signal: {symbol} price anomaly detected")
+        except Exception as e:
+            logger.debug(f"Microstructure check error for {symbol}: {e}")
 
     async def _on_signal_data(self, data: Dict[str, Any]) -> None:
         """Handle incoming signal data from Kafka."""
-        # Use signals for model label generation and feedback
-        pass
+        try:
+            signal_type = data.get("signal_type")
+            symbol = data.get("symbol")
+            strength = data.get("strength", 0.0)
+
+            if symbol and strength != 0.0:
+                # Validate signal
+                if abs(strength) > 1.0:
+                    logger.warning(f"Signal strength out of range for {symbol}: {strength}")
+                    strength = max(-1.0, min(1.0, strength))
+
+                # Route to decision engine
+                if hasattr(self, '_decision_router') and self._decision_router:
+                    self._decision_router.process_signal(symbol, signal_type, strength, data)
+
+                # Update signal buffer for model training
+                if not hasattr(self, '_signal_buffer'):
+                    self._signal_buffer = {}
+                if symbol not in self._signal_buffer:
+                    self._signal_buffer[symbol] = []
+                self._signal_buffer[symbol].append({
+                    "signal_type": signal_type,
+                    "strength": strength,
+                    "timestamp": data.get("timestamp", time.time()),
+                    "data": data,
+                })
+
+                # Keep last 100 signals
+                if len(self._signal_buffer[symbol]) > 100:
+                    self._signal_buffer[symbol] = self._signal_buffer[symbol][-100:]
+
+        except Exception as e:
+            logger.warning(f"Signal processing error: {e}")
 
     # ========================================================================
     # Health Monitoring

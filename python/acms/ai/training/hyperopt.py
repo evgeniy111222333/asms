@@ -648,7 +648,7 @@ class HyperoptManager:
                     ))
         except ValueError:
             # No completed trials yet
-            pass
+            logger.debug("No completed trials yet for best params")
 
     @property
     def best_params(self) -> Optional[Dict[str, Any]]:

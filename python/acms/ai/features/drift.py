@@ -898,7 +898,7 @@ class FeatureDriftMonitor:
             try:
                 await self._check_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Drift monitoring task cancelled during stop")
         logger.info("Drift monitoring stopped")
 
     async def _monitoring_loop(self) -> None:

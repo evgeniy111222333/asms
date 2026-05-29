@@ -182,7 +182,8 @@ def _intercept_standard_logging(level: str = "INFO") -> None:
             logging.getLogger(name).propagate = True
 
     except ImportError:
-        pass
+        logger = logging.getLogger(__name__)
+        logger.debug("loguru not available, using standard logging")
 
 
 # ============================================================================

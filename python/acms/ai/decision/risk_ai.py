@@ -298,11 +298,12 @@ class NeuralVaR:
 # ---------------------------------------------------------------------------
 
 class StressScenarioGenerator:
-    """GAN-inspired stress scenario generation for risk testing.
+    """Parametric stress scenario generation for risk testing.
 
-    Generates extreme market scenarios using learned distribution
-    transformations. In production, this would use a trained GAN;
-    here we use a parametric generator with fat-tailed distributions.
+    Generates extreme market scenarios using fat-tailed distributions
+    and scenario-specific transformations. The neural network generator
+    is available for trained model-based generation but falls back
+    to parametric methods when not trained.
 
     Attributes:
         n_assets: Number of assets in the portfolio.
@@ -325,9 +326,12 @@ class StressScenarioGenerator:
         self.n_assets = n_assets
         self.scenario_types = scenario_types or list(StressScenarioType)
         self._device = "cuda" if (device == "auto" and GPU_AVAILABLE) else "cpu"
+        self._use_neural = False  # Disabled until generator is properly trained
 
         if torch is not None and nn is not None:
             # Scenario generator network (Generator-like)
+            # NOTE: This network requires training before use.
+            # Until trained, parametric methods are used for generation.
             self.generator = nn.Sequential(
                 nn.Linear(32 + len(self.scenario_types), 64),
                 nn.ReLU(),
@@ -336,6 +340,7 @@ class StressScenarioGenerator:
                 nn.Linear(128, n_assets),
                 nn.Tanh(),  # Bounded returns
             ).to(self._device)
+            self.generator.eval()  # Keep in eval mode until trained
         else:
             self.generator = None
 
@@ -547,6 +552,10 @@ class RealTimeRiskPredictor:
         self._ewma_var: Optional[float] = None
         self._span = 20  # EWMA span
 
+        # Rolling return history for proper VaR/CVaR computation
+        self._return_history: List[float] = []
+        self._max_history = lookback
+
     def update(
         self,
         portfolio_return: float,
@@ -563,6 +572,11 @@ class RealTimeRiskPredictor:
         Returns:
             Updated RiskMetrics.
         """
+        # Store return in rolling history
+        self._return_history.append(portfolio_return)
+        if len(self._return_history) > self._max_history:
+            self._return_history = self._return_history[-self._max_history:]
+
         # EWMA volatility update
         if self._ewma_vol is None:
             self._ewma_vol = abs(portfolio_return)
@@ -575,21 +589,46 @@ class RealTimeRiskPredictor:
         # Annualize
         annualized_vol = self._ewma_vol * np.sqrt(252)
 
-        # Simple VaR estimate
-        if self._ewma_var is None:
-            self._ewma_var = 1.645 * self._ewma_vol  # 95% parametric
+        # Compute VaR and CVaR properly from rolling history
+        returns_arr = np.array(self._return_history)
+
+        if len(returns_arr) >= 30:
+            sorted_returns = np.sort(returns_arr)
+            n = len(sorted_returns)
+
+            # VaR_95: 5th percentile of historical returns
+            var_95 = float(sorted_returns[int(0.05 * n)])
+            # VaR_99: 1st percentile of historical returns
+            var_99 = float(sorted_returns[int(0.01 * n)])
+
+            # CVaR_95: mean of tail below VaR_95
+            tail_95 = sorted_returns[sorted_returns <= var_95]
+            cvar_95 = float(np.mean(tail_95)) if len(tail_95) > 0 else var_95
+
+            # CVaR_99: mean of tail below VaR_99
+            tail_99 = sorted_returns[sorted_returns <= var_99]
+            cvar_99 = float(np.mean(tail_99)) if len(tail_99) > 0 else var_99
+
+            # Use absolute values for risk metrics (VaR is typically positive)
+            var_95 = abs(var_95)
+            var_99 = abs(var_99)
+            cvar_95 = abs(cvar_95)
+            cvar_99 = abs(cvar_99)
         else:
-            alpha = 2.0 / (self._span + 1)
-            self._ewma_var = alpha * (1.645 * self._ewma_vol) + (1 - alpha) * self._ewma_var
+            # Not enough history for historical VaR: use EWMA-based parametric estimate
+            var_95 = 1.645 * self._ewma_vol if self._ewma_vol else 0.0
+            var_99 = 2.326 * self._ewma_vol if self._ewma_vol else 0.0
+            cvar_95 = var_95 * 1.2  # Conservative estimate
+            cvar_99 = var_99 * 1.3
 
         # Risk level classification
-        risk_level = self._classify_risk(annualized_vol, self._ewma_var)
+        risk_level = self._classify_risk(annualized_vol, var_95)
 
         metrics = RiskMetrics(
-            var_95=self._ewma_var,
-            var_99=self._ewma_var * 1.2,  # Approximate scaling
-            cvar_95=self._ewma_var * 1.3,
-            cvar_99=self._ewma_var * 1.5,
+            var_95=var_95,
+            var_99=var_99,
+            cvar_95=cvar_95,
+            cvar_99=cvar_99,
             volatility=annualized_vol,
             risk_level=risk_level,
         )

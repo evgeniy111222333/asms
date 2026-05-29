@@ -117,13 +117,12 @@ class GPUConfig:
             if torch.cuda.is_available():
                 return list(range(torch.cuda.device_count()))
         except ImportError:
-            pass
+            logger.debug("PyTorch not available for GPU detection")
         return []
 
 
 # ============================================================================
 # Training Configuration
-# ============================================================================
 
 
 @dataclass

@@ -548,13 +548,13 @@ class DistributedCacheCoordinator:
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Cache coordinator task cancelled during stop")
         if self._pubsub:
             try:
                 await self._pubsub.unsubscribe(self._channel)
                 await self._pubsub.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing Redis pubsub: %s", e)
 
     def on_invalidation(self, handler: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Register a handler for invalidation events.
@@ -612,6 +612,6 @@ class DistributedCacheCoordinator:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Invalid invalidation event received")
         except asyncio.CancelledError:
-            pass
+            logger.debug("Cache coordinator listen cancelled")
         except Exception as e:
             logger.error("Cache coordinator listen error: %s", e)

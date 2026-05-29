@@ -200,7 +200,7 @@ class NodeInfo:
             info.memory_available_gb = mem.available / (1024 ** 3)
             info.cpu_percent = psutil.cpu_percent(interval=0.1)
         except ImportError:
-            pass
+            logger.debug("psutil not available for system info")
 
         return info
 

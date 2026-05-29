@@ -613,7 +613,7 @@ class ABTestManager:
             try:
                 await self._check_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("AB test checker task cancelled during stop")
         logger.info("ABTestManager stopped")
 
     async def create_test(self, config: ABTestConfig) -> str:

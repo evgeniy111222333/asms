@@ -152,8 +152,8 @@ class DataQualityFilter:
                 if abs(age) > self.max_age_seconds:
                     self._filter_stats["stale_data"] += 1
                     return DataQuality.SUSPICIOUS
-            except (ValueError, TypeError):
-                pass  # Can't parse timestamp, accept data
+            except (ValueError, TypeError) as e:
+                logger.debug("Could not parse timestamp in quality check: %s", e)
 
         self._filter_stats["valid"] += 1
         return DataQuality.VALID
@@ -246,7 +246,7 @@ class TrainingDataBuffer:
             try:
                 await self._flush_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Flush task cancelled during stop")
         # Final flush
         await self.flush()
 
@@ -408,12 +408,12 @@ class AIKafkaConsumer:
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                logger.debug("AI consumer task cancelled during stop")
         if self._consumer:
             try:
                 await self._consumer.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error stopping AI Kafka consumer: %s", e)
         logger.info("AIKafkaConsumer stopped (consumed: %d, filtered: %d, errors: %d)",
                      self._consumed_count, self._filtered_count, self._error_count)
 
@@ -480,7 +480,7 @@ class AIKafkaConsumer:
                     logger.error("Error processing message from '%s': %s", message.topic, e)
 
         except asyncio.CancelledError:
-            pass
+            logger.debug("AI consume loop cancelled")
         except Exception as e:
             logger.error("Consumer loop error: %s", e)
 

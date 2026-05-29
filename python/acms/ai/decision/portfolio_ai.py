@@ -349,15 +349,26 @@ class AttentionAssetWeighter:
         # Store for explainability
         self.last_attention_weights = attn_weights.squeeze().cpu().detach().numpy()
 
-        # Generate weights
-        # Use return/vol features directly for per-asset weights
+        # USE the attention output to modulate per-asset features
         asset_features = torch.tensor(
             np.stack([returns, volatilities, correlations], axis=1),
             dtype=torch.float32,
             device=self._device,
         )
-        scores = asset_features.sum(dim=1)
-        weights = F.softmax(scores, dim=0).cpu().detach().numpy()
+        # Apply attention-modulated scaling: use attn_output to weight the features
+        attn_scale = torch.sigmoid(attn_output.squeeze(1))  # (1, d_model) -> (1, d_model)
+        # Project attention output to per-asset scores
+        attn_scores = self.weight_output(encoded)  # (1, 1) via Sequential with Softmax
+        # Instead, compute weights using attention-aware feature combination
+        # Use the encoded representation to produce per-asset attention scores
+        per_asset_attn = torch.matmul(
+            asset_features,  # (n_assets, 3)
+            attn_scale.squeeze(0)[:3].unsqueeze(1)  # (3, 1)
+        ).squeeze(1)  # (n_assets,)
+        # Combine with raw feature scores
+        raw_scores = asset_features.sum(dim=1)
+        combined_scores = 0.6 * raw_scores + 0.4 * per_asset_attn
+        weights = F.softmax(combined_scores, dim=0).cpu().detach().numpy()
 
         return weights
 
@@ -536,38 +547,231 @@ class MultiObjectiveOptimizer:
         max_drawdowns: np.ndarray,
         current_weights: Optional[np.ndarray] = None,
         n_candidates: int = 200,
+        population_size: int = 50,
+        n_generations: int = 20,
     ) -> Tuple[np.ndarray, Dict[str, float]]:
-        """Find Pareto-optimal portfolio weights.
+        """Find Pareto-optimal portfolio weights using NSGA-II algorithm.
+
+        Uses non-dominated sorting and crowding distance to find
+        Pareto-optimal solutions, then selects the best compromise
+        via scalarization.
 
         Args:
             expected_returns: Expected returns per asset.
             covariance_matrix: Covariance matrix.
             max_drawdowns: Maximum historical drawdown per asset.
             current_weights: Current weights for turnover computation.
-            n_candidates: Number of candidate portfolios to evaluate.
+            n_candidates: Number of random initial candidates.
+            population_size: Population size for NSGA-II.
+            n_generations: Number of NSGA-II generations.
 
         Returns:
             Tuple of (optimal_weights, objective_scores).
         """
         n_assets = len(expected_returns)
-        best_weights = np.ones(n_assets) / n_assets
-        best_score = -np.inf
-        best_objectives: Dict[str, float] = {}
 
-        for _ in range(n_candidates):
-            # Random candidate weights
-            w = np.random.dirichlet(np.ones(n_assets))
-            objectives = self._evaluate_objectives(
-                w, expected_returns, covariance_matrix, max_drawdowns, current_weights
-            )
+        # Initialize population with Dirichlet-distributed weights
+        # and a few heuristic solutions
+        population = []
 
-            score = self._scalarize(objectives)
-            if score > best_score:
-                best_score = score
-                best_weights = w.copy()
-                best_objectives = objectives
+        # Heuristic solutions
+        # 1. Equal weight
+        population.append(np.ones(n_assets) / n_assets)
+        # 2. Return-weighted
+        ret_pos = np.clip(expected_returns, 0, None)
+        if ret_pos.sum() > 0:
+            population.append(ret_pos / ret_pos.sum())
+        # 3. Risk parity (inverse vol)
+        vols = np.sqrt(np.diag(covariance_matrix))
+        inv_vol = 1.0 / (vols + 1e-8)
+        population.append(inv_vol / inv_vol.sum())
+        # 4. Min drawdown
+        dd_inv = 1.0 / (max_drawdowns + 1e-8)
+        population.append(dd_inv / dd_inv.sum())
+
+        # Random Dirichlet candidates
+        for _ in range(population_size - len(population)):
+            population.append(np.random.dirichlet(np.ones(n_assets)))
+
+        population = np.array(population[:population_size])
+
+        # NSGA-II main loop
+        for gen in range(n_generations):
+            # Evaluate objectives for all individuals
+            objectives = np.array([
+                self._evaluate_objectives_vector(w, expected_returns, covariance_matrix, max_drawdowns, current_weights)
+                for w in population
+            ])
+
+            # Non-dominated sorting
+            fronts = self._non_dominated_sort(objectives)
+
+            # Compute crowding distance for each front
+            crowding_distances = np.zeros(len(population))
+            for front in fronts:
+                if len(front) <= 1:
+                    crowding_distances[front] = np.inf
+                    continue
+                front_objectives = objectives[front]
+                for obj_idx in range(objectives.shape[1]):
+                    sorted_idx = np.argsort(front_objectives[:, obj_idx])
+                    sorted_front = [front[i] for i in sorted_idx]
+                    crowding_distances[sorted_front[0]] = np.inf
+                    crowding_distances[sorted_front[-1]] = np.inf
+                    obj_range = front_objectives[sorted_idx[-1], obj_idx] - front_objectives[sorted_idx[0], obj_idx]
+                    if obj_range > 0:
+                        for k in range(1, len(sorted_front) - 1):
+                            crowding_distances[sorted_front[k]] += (
+                                front_objectives[sorted_idx[k + 1], obj_idx]
+                                - front_objectives[sorted_idx[k - 1], obj_idx]
+                            ) / obj_range
+
+            # Create offspring via crossover and mutation
+            offspring = []
+            for _ in range(population_size):
+                # Tournament selection
+                parent1 = self._tournament_select(population, fronts, crowding_distances)
+                parent2 = self._tournament_select(population, fronts, crowding_distances)
+                # SBX-like crossover
+                child = 0.5 * (parent1 + parent2)
+                # Mutation: small perturbation
+                child += np.random.normal(0, 0.05 / (gen + 1), size=n_assets)
+                child = np.clip(child, 0.001, None)
+                child /= child.sum()  # Normalize
+                offspring.append(child)
+
+            offspring = np.array(offspring)
+
+            # Combine and select next generation
+            combined = np.vstack([population, offspring])
+            combined_objectives = np.array([
+                self._evaluate_objectives_vector(w, expected_returns, covariance_matrix, max_drawdowns, current_weights)
+                for w in combined
+            ])
+            combined_fronts = self._non_dominated_sort(combined_objectives)
+            combined_crowding = np.zeros(len(combined))
+            for front in combined_fronts:
+                if len(front) <= 1:
+                    combined_crowding[front] = np.inf
+                    continue
+                front_obj = combined_objectives[front]
+                for obj_idx in range(combined_objectives.shape[1]):
+                    sorted_idx = np.argsort(front_obj[:, obj_idx])
+                    sorted_front = [front[i] for i in sorted_idx]
+                    combined_crowding[sorted_front[0]] = np.inf
+                    combined_crowding[sorted_front[-1]] = np.inf
+                    obj_range = front_obj[sorted_idx[-1], obj_idx] - front_obj[sorted_idx[0], obj_idx]
+                    if obj_range > 0:
+                        for k in range(1, len(sorted_front) - 1):
+                            combined_crowding[sorted_front[k]] += (
+                                front_obj[sorted_idx[k + 1], obj_idx]
+                                - front_obj[sorted_idx[k - 1], obj_idx]
+                            ) / obj_range
+
+            # Select top population_size individuals
+            new_population = []
+            for front in combined_fronts:
+                if len(new_population) + len(front) <= population_size:
+                    new_population.extend(front)
+                else:
+                    remaining = population_size - len(new_population)
+                    front_by_crowding = sorted(front, key=lambda x: combined_crowding[x], reverse=True)
+                    new_population.extend(front_by_crowding[:remaining])
+                    break
+
+            population = combined[new_population]
+
+        # Select best solution from final population using scalarization
+        final_objectives = [
+            self._evaluate_objectives(w, expected_returns, covariance_matrix, max_drawdowns, current_weights)
+            for w in population
+        ]
+        best_idx = max(range(len(final_objectives)), key=lambda i: self._scalarize(final_objectives[i]))
+        best_weights = population[best_idx]
+        best_objectives = final_objectives[best_idx]
 
         return best_weights, best_objectives
+
+    def _evaluate_objectives_vector(
+        self,
+        weights: np.ndarray,
+        expected_returns: np.ndarray,
+        covariance_matrix: np.ndarray,
+        max_drawdowns: np.ndarray,
+        current_weights: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Evaluate objectives as a vector (for NSGA-II sorting)."""
+        obj_dict = self._evaluate_objectives(
+            weights, expected_returns, covariance_matrix, max_drawdowns, current_weights
+        )
+        # Return as vector: [return, -risk, sharpe, -drawdown, -turnover]
+        return np.array([
+            obj_dict.get(OptimizationObjective.MAX_RETURN.value, 0.0),
+            obj_dict.get(OptimizationObjective.MIN_RISK.value, 0.0),
+            obj_dict.get(OptimizationObjective.MAX_SHARPE.value, 0.0),
+            obj_dict.get(OptimizationObjective.MIN_DRAWDOWN.value, 0.0),
+            obj_dict.get(OptimizationObjective.MIN_TURNOVER.value, 0.0),
+        ])
+
+    def _non_dominated_sort(self, objectives: np.ndarray) -> List[List[int]]:
+        """Perform non-dominated sorting on objective vectors."""
+        n = len(objectives)
+        domination_count = np.zeros(n, dtype=int)
+        dominated_set: List[List[int]] = [[] for _ in range(n)]
+        rank = np.zeros(n, dtype=int)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if self._dominates(objectives[i], objectives[j]):
+                    dominated_set[i].append(j)
+                    domination_count[j] += 1
+                elif self._dominates(objectives[j], objectives[i]):
+                    dominated_set[j].append(i)
+                    domination_count[i] += 1
+
+        fronts = []
+        current_front = list(np.where(domination_count == 0)[0])
+        while current_front:
+            fronts.append(current_front)
+            next_front = []
+            for i in current_front:
+                for j in dominated_set[i]:
+                    domination_count[j] -= 1
+                    if domination_count[j] == 0:
+                        next_front.append(j)
+            current_front = next_front
+
+        return fronts
+
+    @staticmethod
+    def _dominates(obj_a: np.ndarray, obj_b: np.ndarray) -> bool:
+        """Check if obj_a dominates obj_b (Pareto dominance)."""
+        better_in_any = False
+        for a, b in zip(obj_a, obj_b):
+            if a > b:
+                better_in_any = True
+            elif a < b:
+                return False
+        return better_in_any
+
+    def _tournament_select(
+        self, population: np.ndarray, fronts: List[List[int]], crowding: np.ndarray
+    ) -> np.ndarray:
+        """Tournament selection based on rank and crowding distance."""
+        rank = np.zeros(len(population), dtype=int)
+        for r, front in enumerate(fronts):
+            for idx in front:
+                rank[idx] = r
+
+        i, j = np.random.choice(len(population), 2, replace=False)
+        if rank[i] < rank[j]:
+            return population[i]
+        elif rank[j] < rank[i]:
+            return population[j]
+        elif crowding[i] > crowding[j]:
+            return population[i]
+        else:
+            return population[j]
 
     def _evaluate_objectives(
         self,
@@ -701,10 +905,23 @@ class PortfolioStateEncoder:
             with torch.no_grad():
                 embedding = self.encoder(x).cpu().numpy()
         else:
-            # Simple PCA-like projection
-            np.random.seed(42)
-            projection = np.random.randn(len(state), self.state_dim) / np.sqrt(len(state))
-            embedding = state @ projection
+            # PCA-like projection using data statistics instead of random seed
+            # Center the state
+            state_mean = np.mean(state)
+            state_centered = state - state_mean
+            state_std = np.std(state_centered) + 1e-8
+            state_normalized = state_centered / state_std
+
+            # Create a deterministic projection using the data structure
+            # Use DCT-like basis for a more meaningful projection
+            n_features = len(state_normalized)
+            projection = np.zeros((n_features, self.state_dim))
+            for j in range(self.state_dim):
+                freq = (j + 1) * np.pi / n_features
+                for i in range(n_features):
+                    projection[i, j] = np.cos(freq * (i + 0.5)) / np.sqrt(n_features)
+
+            embedding = state_normalized @ projection
 
         return embedding
 

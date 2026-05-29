@@ -809,7 +809,7 @@ class BaseModel(abc.ABC):
             torch.save(state, str(path))
             return True
         except ImportError:
-            pass
+            logger.debug("PyTorch not available for state serialization, falling back to pickle")
 
         import pickle
         with open(path, "wb") as f:
@@ -830,7 +830,7 @@ class BaseModel(abc.ABC):
             import torch
             return torch.load(str(path), map_location="cpu", weights_only=False)
         except ImportError:
-            pass
+            logger.debug("PyTorch not available for state deserialization, falling back to pickle")
 
         import pickle
         with open(path, "rb") as f:
@@ -993,8 +993,8 @@ class BaseModel(abc.ABC):
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-            except (ImportError, RuntimeError):
-                pass
+            except (ImportError, RuntimeError) as e:
+                logger.debug("Could not synchronize GPU: %s", e)
 
         logger.info("Model '%s' warmup complete", self._model_id)
 

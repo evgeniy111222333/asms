@@ -426,7 +426,25 @@ impl RiskHotPath {
             .map(|p| p.value().quantity * p.value().mark_price)
             .unwrap_or(Decimal::ZERO);
         let order_notional = order.quantity * order.price.unwrap_or(Decimal::ZERO);
-        let new_pos = current_pos + order_notional;
+
+        // Determine signed exposure change based on order direction vs current position
+        let exposure_delta = if current_pos == Decimal::ZERO {
+            // No existing position: any order increases exposure
+            order_notional
+        } else {
+            let current_side = self
+                .positions
+                .get(&order.symbol)
+                .map(|p| p.value().side)
+                .unwrap_or(Side::Buy);
+            match (current_side, order.side) {
+                // Same direction: exposure increases
+                (Side::Buy, Side::Buy) | (Side::Sell, Side::Sell) => order_notional,
+                // Opposite direction: exposure decreases (closes/reduces position)
+                (Side::Buy, Side::Sell) | (Side::Sell, Side::Buy) => -order_notional.min(current_pos),
+            }
+        };
+        let new_pos = (current_pos + exposure_delta).max(Decimal::ZERO);
         results.push(RiskCheckResult {
             decision: if new_pos <= self.limits.max_position_per_symbol { RiskDecision::Allow } else { RiskDecision::Reject },
             check_name: "position_limit_symbol".to_string(),

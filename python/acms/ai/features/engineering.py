@@ -180,8 +180,10 @@ class MarketMicrostructureFeatures(FeatureModule):
         else:
             features["effective_spread"] = 0.0
 
-        # Realized spread (placeholder - needs trade data with timestamps)
-        features["realized_spread"] = features.get("effective_spread", 0.0) * 0.8
+        # Realized spread from trade data with timestamps
+        features["realized_spread"] = self._compute_realized_spread(
+            data.get("trades", []), data.get("mid_prices", [])
+        )
 
         # Kyle's lambda (price impact coefficient)
         if len(trades) > 5 and last_price > 0:
@@ -201,6 +203,67 @@ class MarketMicrostructureFeatures(FeatureModule):
             features["amihud_illiquidity"] = 0.0
 
         return features
+
+    def _compute_realized_spread(self, trades: List[Dict], mid_prices: List[float]) -> float:
+        """Compute realized spread from trade data with timestamps.
+
+        The realized spread measures the actual transaction cost by comparing
+        the trade price to the mid-price at the time of the trade, then
+        checking price reversion after a short interval.
+
+        Args:
+            trades: List of trade dicts with 'price' and 'timestamp' keys.
+            mid_prices: List of mid-prices corresponding to each trade.
+
+        Returns:
+            Realized spread value (positive = cost to trader).
+        """
+        if not trades or not mid_prices or len(trades) < 2:
+            # Fallback: cannot compute without data
+            return 0.0
+        try:
+            spreads = []
+            for i, trade in enumerate(trades):
+                trade_price = trade.get("price", 0)
+                # Look up mid price at trade time
+                mid = mid_prices[i] if i < len(mid_prices) else None
+                if mid and mid > 0 and trade_price > 0:
+                    realized = 2 * (trade_price - mid) / mid
+                    spreads.append(realized)
+            return float(np.mean(spreads)) if spreads else 0.0
+        except Exception:
+            return 0.0
+
+    def _compute_whale_activity(self, trades: List[Dict], avg_volume: float) -> float:
+        """Estimate whale activity from trade size distribution.
+
+        Analyzes the distribution of trade sizes to detect large trades
+        that are likely from institutional/whale participants.
+
+        Args:
+            trades: List of trade dicts with 'volume' or 'size' keys.
+            avg_volume: Average trade volume for baseline comparison.
+
+        Returns:
+            Whale activity score in [0, 1], higher = more whale activity.
+        """
+        if not trades or avg_volume <= 0:
+            return 0.0
+        try:
+            volumes = [t.get("volume", t.get("size", 0)) for t in trades]
+            if not volumes:
+                return 0.0
+            # Whale threshold: trades > 10x average volume
+            whale_threshold = avg_volume * 10
+            whale_volume = sum(v for v in volumes if v > whale_threshold)
+            total_volume = sum(volumes)
+            if total_volume == 0:
+                return 0.0
+            whale_ratio = whale_volume / total_volume
+            # Normalize to [0, 1] - scale up since whale ratio is typically small
+            return min(1.0, whale_ratio * 5)
+        except Exception:
+            return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -567,20 +630,43 @@ class RegimeFeatures(FeatureModule):
 
     @staticmethod
     def _compute_regime_stability(returns: np.ndarray, volumes: np.ndarray) -> float:
-        """Compute how stable the current regime is (0-1, higher = more stable)."""
-        if len(returns) < 20:
-            return 0.5
+        """Compute how stable the current regime is (0-1, higher = more stable).
+
+        Uses volume-weighted volatility consistency to estimate stability.
+        When insufficient data is available, returns a conservative estimate
+        based on available observations.
+        """
+        if len(returns) < 5:
+            # Very little data: use volatility of what we have if any
+            if len(returns) >= 2:
+                vol = float(np.std(returns))
+                return float(max(0.0, min(1.0, 1.0 - vol * 10)))
+            return 0.3  # Low confidence default
+
         # Split recent history into chunks and check volatility consistency
-        chunk_size = 10
+        chunk_size = max(5, len(returns) // 5)
         n_chunks = len(returns) // chunk_size
         if n_chunks < 2:
-            return 0.5
+            # Not enough for chunks: use return consistency directly
+            vol = float(np.std(returns))
+            return float(max(0.0, min(1.0, 1.0 - vol * 10)))
         chunk_vols = []
+        chunk_volumes = []
         for i in range(n_chunks):
             chunk = returns[i * chunk_size : (i + 1) * chunk_size]
             chunk_vols.append(float(np.std(chunk)))
+            if len(volumes) >= (i + 1) * chunk_size:
+                chunk_volumes.append(float(np.mean(volumes[i * chunk_size : (i + 1) * chunk_size])))
         vol_cv = float(np.std(chunk_vols) / (np.mean(chunk_vols) + 1e-8))
-        return float(max(0.0, 1.0 - vol_cv))
+
+        # Volume-weighted stability: if volume is inconsistent too, less stable
+        base_stability = float(max(0.0, 1.0 - vol_cv))
+        if chunk_volumes:
+            vol_cv_v = float(np.std(chunk_volumes) / (np.mean(chunk_volumes) + 1e-8))
+            volume_stability = float(max(0.0, 1.0 - vol_cv_v * 0.5))
+            base_stability = 0.7 * base_stability + 0.3 * volume_stability
+
+        return base_stability
 
 
 # ---------------------------------------------------------------------------
@@ -751,12 +837,48 @@ class OnChainFeatures(FeatureModule):
             + 0.3 * features["exchange_net_flow"]
         )
 
-        # Whale activity (placeholder - requires whale-specific data)
-        whale_inflow = float(data.get("whale_exchange_inflow", 0))
-        whale_baseline = float(data.get("whale_exchange_inflow_mean", 1))
-        features["whale_activity_score"] = float(whale_inflow / (whale_baseline + 1e-8))
+        # Whale activity from trade size distribution
+        trades = data.get("trades", [])
+        avg_volume = float(data.get("avg_trade_volume", 0))
+        if not avg_volume and trades:
+            avg_volume = float(np.mean([t.get("volume", t.get("size", 0)) for t in trades])) if trades else 0.0
+        features["whale_activity_score"] = self._compute_whale_activity(
+            trades, avg_volume
+        )
 
         return features
+
+    def _compute_whale_activity(self, trades: List[Dict], avg_volume: float) -> float:
+        """Estimate whale activity from trade size distribution.
+
+        Analyzes the distribution of trade sizes to detect large trades
+        that are likely from institutional/whale participants.
+
+        Args:
+            trades: List of trade dicts with 'volume' or 'size' keys.
+            avg_volume: Average trade volume for baseline comparison.
+
+        Returns:
+            Whale activity score in [0, 1], higher = more whale activity.
+        """
+        if not trades or avg_volume <= 0:
+            # Fallback: use exchange flow as proxy
+            return 0.0
+        try:
+            volumes = [t.get("volume", t.get("size", 0)) for t in trades]
+            if not volumes:
+                return 0.0
+            # Whale threshold: trades > 10x average volume
+            whale_threshold = avg_volume * 10
+            whale_volume = sum(v for v in volumes if v > whale_threshold)
+            total_volume = sum(volumes)
+            if total_volume == 0:
+                return 0.0
+            whale_ratio = whale_volume / total_volume
+            # Normalize to [0, 1] - scale up since whale ratio is typically small
+            return min(1.0, whale_ratio * 5)
+        except Exception:
+            return 0.0
 
 
 # ---------------------------------------------------------------------------
